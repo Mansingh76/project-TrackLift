@@ -1,0 +1,644 @@
+"""
+TrackLift
+A data science style application for tracking strength training progression
+"""
+
+import sqlite3
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+from datetime import datetime, timedelta
+from typing import Optional, Tuple, List, Dict
+import json
+
+class TrackLift:
+    """Main class for managing strength progression tracking"""
+    
+    def __init__(self, db_path: str = "strength_tracker.db"):
+        """Initialize the tracker with a database connection"""
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path)
+        self.cursor = self.conn.cursor()
+        self._initialize_database()
+        
+    def _initialize_database(self):
+        """Create database tables if they don't exist"""
+        
+        # Create exercises table
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS exercises (
+                exercise_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exercise_name TEXT NOT NULL UNIQUE,
+                category TEXT NOT NULL,
+                increment_kg REAL NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Create progression_plans table
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS progression_plans (
+                plan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exercise_id INTEGER NOT NULL,
+                week_number INTEGER NOT NULL,
+                planned_weight REAL NOT NULL,
+                sets INTEGER NOT NULL,
+                reps_min INTEGER NOT NULL,
+                reps_max INTEGER NOT NULL,
+                is_deload BOOLEAN DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (exercise_id) REFERENCES exercises(exercise_id),
+                UNIQUE(exercise_id, week_number, created_at)
+            )
+        """)
+        
+        # Create user_logs table
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_logs (
+                log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exercise_id INTEGER NOT NULL,
+                plan_id INTEGER,
+                week_number INTEGER NOT NULL,
+                actual_weight REAL NOT NULL,
+                actual_sets INTEGER NOT NULL,
+                actual_reps INTEGER NOT NULL,
+                performance_status TEXT,
+                notes TEXT,
+                logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (exercise_id) REFERENCES exercises(exercise_id),
+                FOREIGN KEY (plan_id) REFERENCES progression_plans(plan_id)
+            )
+        """)
+        
+        self.conn.commit()
+    
+    def add_exercise(self, exercise_name: str, category: str = "barbell") -> int:
+        """Add a new exercise to the database"""
+        
+        # Define increment rules based on category
+        increment_map = {
+            "barbell": 5.0,
+            "dumbbell": 2.5,  # per hand
+            "isolation": 2.0,
+            "small_muscle": 1.0
+        }
+        
+        increment_kg = increment_map.get(category, 2.5)
+        
+        try:
+            self.cursor.execute("""
+                INSERT INTO exercises (exercise_name, category, increment_kg)
+                VALUES (?, ?, ?)
+            """, (exercise_name, category, increment_kg))
+            self.conn.commit()
+            return self.cursor.lastrowid
+        except sqlite3.IntegrityError:
+            # Exercise already exists, get its ID
+            self.cursor.execute("""
+                SELECT exercise_id FROM exercises WHERE exercise_name = ?
+            """, (exercise_name,))
+            return self.cursor.fetchone()[0]
+    
+    def generate_progression_plan(
+        self,
+        exercise_name: str,
+        current_max: float,
+        goal_weight: float,
+        num_weeks: int,
+        category: str = "barbell",
+        starting_percentage: float = 0.85
+    ) -> pd.DataFrame:
+        """Generate a weekly progression plan with deloads"""
+        
+        # Add exercise if not exists
+        exercise_id = self.add_exercise(exercise_name, category)
+        
+        # Get increment value
+        self.cursor.execute("""
+            SELECT increment_kg FROM exercises WHERE exercise_id = ?
+        """, (exercise_id,))
+        increment_kg = self.cursor.fetchone()[0]
+        
+        # Calculate starting weight
+        start_weight = current_max * starting_percentage
+        
+        # Define sets and reps based on category
+        if category in ["barbell", "dumbbell"]:
+            sets = 3
+            reps_min, reps_max = 3, 7
+        else:  # isolation
+            sets = 3
+            reps_min, reps_max = 7, 10
+        
+        # Generate progression plan
+        plan_data = []
+        current_weight = start_weight
+        
+        for week in range(1, num_weeks + 1):
+            is_deload = (week % 4 == 0)
+            
+            if is_deload:
+                # Deload week - 70% of last working weight
+                planned_weight = current_weight * 0.7
+                week_sets = sets - 1  # Reduce sets on deload
+            else:
+                if week > 1 and (week - 1) % 4 != 0:  # Not after deload
+                    current_weight += increment_kg
+                elif week > 4 and (week - 1) % 4 == 0:  # After deload
+                    current_weight += increment_kg
+                    
+                planned_weight = min(current_weight, goal_weight)
+                week_sets = sets
+            
+            plan_data.append({
+                'exercise_id': exercise_id,
+                'week_number': week,
+                'planned_weight': round(planned_weight, 1),
+                'sets': week_sets,
+                'reps_min': reps_min,
+                'reps_max': reps_max,
+                'is_deload': is_deload
+            })
+        
+        # Ensure we reach the goal weight if possible
+        if plan_data[-1]['planned_weight'] < goal_weight and not plan_data[-1]['is_deload']:
+            plan_data[-1]['planned_weight'] = goal_weight
+            
+        return pd.DataFrame(plan_data)
+    
+    def save_progression_plan(self, plan_df: pd.DataFrame) -> List[int]:
+        """Save progression plan to database"""
+        plan_ids = []
+        
+        for _, row in plan_df.iterrows():
+            self.cursor.execute("""
+                INSERT INTO progression_plans 
+                (exercise_id, week_number, planned_weight, sets, reps_min, reps_max, is_deload)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                row['exercise_id'],
+                row['week_number'],
+                row['planned_weight'],
+                row['sets'],
+                row['reps_min'],
+                row['reps_max'],
+                row['is_deload']
+            ))
+            plan_ids.append(self.cursor.lastrowid)
+            
+        self.conn.commit()
+        return plan_ids
+    
+    def log_workout(
+        self,
+        exercise_name: str,
+        week_number: int,
+        actual_weight: float,
+        actual_sets: int,
+        actual_reps: int,
+        notes: str = ""
+    ) -> str:
+        """Log actual workout results and calculate performance status"""
+        
+        # Get exercise ID
+        self.cursor.execute("""
+            SELECT exercise_id FROM exercises WHERE exercise_name = ?
+        """, (exercise_name,))
+        result = self.cursor.fetchone()
+        
+        if not result:
+            raise ValueError(f"Exercise '{exercise_name}' not found")
+        
+        exercise_id = result[0]
+        
+        # Get planned weight for this week
+        self.cursor.execute("""
+            SELECT plan_id, planned_weight 
+            FROM progression_plans 
+            WHERE exercise_id = ? AND week_number = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (exercise_id, week_number))
+        
+        plan_result = self.cursor.fetchone()
+        plan_id = plan_result[0] if plan_result else None
+        planned_weight = plan_result[1] if plan_result else actual_weight
+        
+        # Calculate performance status
+        performance_status = self._calculate_performance_status(
+            planned_weight, actual_weight
+        )
+        
+        # Insert log
+        self.cursor.execute("""
+            INSERT INTO user_logs 
+            (exercise_id, plan_id, week_number, actual_weight, actual_sets, 
+             actual_reps, performance_status, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            exercise_id, plan_id, week_number, actual_weight,
+            actual_sets, actual_reps, performance_status, notes
+        ))
+        
+        self.conn.commit()
+        return performance_status
+    
+    def _calculate_performance_status(
+        self, 
+        planned_weight: float, 
+        actual_weight: float
+    ) -> str:
+        """Calculate performance status based on planned vs actual weight"""
+        
+        if actual_weight >= planned_weight * 1.025:
+            return "Easy"
+        elif actual_weight < planned_weight * 0.975:
+            return "Fail"
+        else:
+            return "Normal"
+    
+    def get_progression_data(self, exercise_name: str) -> pd.DataFrame:
+        """Get combined progression plan and actual logs data"""
+        
+        query = """
+            SELECT 
+                e.exercise_name,
+                pp.week_number,
+                pp.planned_weight,
+                pp.sets as planned_sets,
+                pp.reps_min,
+                pp.reps_max,
+                pp.is_deload,
+                ul.actual_weight,
+                ul.actual_sets,
+                ul.actual_reps,
+                ul.performance_status,
+                ul.notes,
+                ul.logged_at
+            FROM exercises e
+            LEFT JOIN progression_plans pp ON e.exercise_id = pp.exercise_id
+            LEFT JOIN user_logs ul ON pp.plan_id = ul.plan_id 
+                AND pp.week_number = ul.week_number
+            WHERE e.exercise_name = ?
+            ORDER BY pp.week_number
+        """
+        
+        df = pd.read_sql_query(query, self.conn, params=(exercise_name,))
+        
+        # Calculate training volume
+        df['planned_volume'] = df['planned_weight'] * df['planned_sets'] * df['reps_max']
+        df['actual_volume'] = df['actual_weight'] * df['actual_sets'] * df['actual_reps']
+        
+        return df
+    
+    def create_progression_visualization(
+        self, 
+        exercise_name: str
+    ) -> go.Figure:
+        """Create interactive Plotly visualizations for progression tracking"""
+        
+        df = self.get_progression_data(exercise_name)
+        
+        if df.empty:
+            print(f"No data found for exercise: {exercise_name}")
+            return None
+        
+        # Create subplots
+        fig = make_subplots(
+            rows=2, cols=2,
+            subplot_titles=(
+                'Weight Progression: Planned vs Actual',
+                'Training Volume per Week',
+                'Performance Status Distribution',
+                'Reps vs Weight Relationship'
+            ),
+            specs=[
+                [{"secondary_y": False}, {"type": "bar"}],
+                [{"type": "pie"}, {"type": "scatter"}]
+            ],
+            vertical_spacing=0.15,
+            horizontal_spacing=0.12
+        )
+        
+        # 1. Line graph: Planned vs Actual progression
+        fig.add_trace(
+            go.Scatter(
+                x=df['week_number'],
+                y=df['planned_weight'],
+                mode='lines+markers',
+                name='Planned Weight',
+                line=dict(color='#3498db', width=3),
+                marker=dict(size=8),
+                hovertemplate='Week %{x}<br>Planned: %{y:.1f} kg<extra></extra>'
+            ),
+            row=1, col=1
+        )
+        
+        # Add actual weight if available
+        actual_data = df[df['actual_weight'].notna()]
+        if not actual_data.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=actual_data['week_number'],
+                    y=actual_data['actual_weight'],
+                    mode='markers+lines',
+                    name='Actual Weight',
+                    line=dict(color='#e74c3c', width=3, dash='dash'),
+                    marker=dict(size=10, symbol='diamond'),
+                    hovertemplate='Week %{x}<br>Actual: %{y:.1f} kg<extra></extra>'
+                ),
+                row=1, col=1
+            )
+        
+        # Mark deload weeks
+        deload_weeks = df[df['is_deload'] == 1]
+        if not deload_weeks.empty:
+            for week in deload_weeks['week_number']:
+                fig.add_vline(
+                    x=week, 
+                    line_dash="dot", 
+                    line_color="gray",
+                    opacity=0.5,
+                    row=1, col=1
+                )
+                fig.add_annotation(
+                    x=week,
+                    y=df[df['week_number'] == week]['planned_weight'].iloc[0],
+                    text="Deload",
+                    showarrow=False,
+                    yshift=10,
+                    font=dict(size=10, color="gray"),
+                    row=1, col=1
+                )
+        
+        # 2. Bar chart: Weekly training volume
+        fig.add_trace(
+            go.Bar(
+                x=df['week_number'],
+                y=df['planned_volume'],
+                name='Planned Volume',
+                marker_color='#3498db',
+                opacity=0.7,
+                hovertemplate='Week %{x}<br>Planned Volume: %{y:.0f}<extra></extra>'
+            ),
+            row=1, col=2
+        )
+        
+        if not actual_data.empty:
+            fig.add_trace(
+                go.Bar(
+                    x=actual_data['week_number'],
+                    y=actual_data['actual_volume'],
+                    name='Actual Volume',
+                    marker_color='#e74c3c',
+                    opacity=0.7,
+                    hovertemplate='Week %{x}<br>Actual Volume: %{y:.0f}<extra></extra>'
+                ),
+                row=1, col=2
+            )
+        
+        # 3. Pie chart: Performance status distribution
+        if not actual_data.empty:
+            status_counts = actual_data['performance_status'].value_counts()
+            colors = {
+                'Easy': '#2ecc71',
+                'Normal': '#3498db',
+                'Fail': '#e74c3c'
+            }
+            
+            fig.add_trace(
+                go.Pie(
+                    labels=status_counts.index,
+                    values=status_counts.values,
+                    marker=dict(colors=[colors.get(s, '#95a5a6') for s in status_counts.index]),
+                    hole=0.3,
+                    textinfo='label+percent',
+                    hovertemplate='%{label}<br>Count: %{value}<br>%{percent}<extra></extra>'
+                ),
+                row=2, col=1
+            )
+        else:
+            # Add placeholder if no actual data
+            fig.add_annotation(
+                text="No workout data logged yet",
+                xref="x3", yref="y3",
+                x=0.5, y=0.5,
+                showarrow=False,
+                font=dict(size=12, color="gray")
+            )
+        
+        # 4. Scatter plot: Reps vs Weight
+        if not actual_data.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=actual_data['actual_weight'],
+                    y=actual_data['actual_reps'],
+                    mode='markers',
+                    marker=dict(
+                        size=actual_data['actual_sets'] * 5,
+                        color=actual_data['week_number'],
+                        colorscale='Viridis',
+                        showscale=True,
+                        colorbar=dict(
+                            title="Week",
+                            x=1.15
+                        )
+                    ),
+                    text=[f"Week {w}" for w in actual_data['week_number']],
+                    hovertemplate='Weight: %{x:.1f} kg<br>Reps: %{y}<br>%{text}<extra></extra>',
+                    showlegend=False
+                ),
+                row=2, col=2
+            )
+        
+        # Update layout
+        fig.update_layout(
+            title=dict(
+                text=f'<b>Strength Progression Analysis: {exercise_name}</b>',
+                x=0.5,
+                xanchor='center',
+                font=dict(size=20)
+            ),
+            height=700,
+            showlegend=True,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=-0.15,
+                xanchor="center",
+                x=0.5
+            ),
+            hovermode='x unified',
+            template='plotly_white'
+        )
+        
+        # Update axes labels
+        fig.update_xaxes(title_text="Week Number", row=1, col=1)
+        fig.update_yaxes(title_text="Weight (kg)", row=1, col=1)
+        fig.update_xaxes(title_text="Week Number", row=1, col=2)
+        fig.update_yaxes(title_text="Volume (kg × sets × reps)", row=1, col=2)
+        fig.update_xaxes(title_text="Weight (kg)", row=2, col=2)
+        fig.update_yaxes(title_text="Reps per Set", row=2, col=2)
+        
+        return fig
+    
+    def get_summary_statistics(self, exercise_name: str) -> Dict:
+        """Get summary statistics for an exercise"""
+        
+        df = self.get_progression_data(exercise_name)
+        actual_data = df[df['actual_weight'].notna()]
+        
+        if actual_data.empty:
+            return {
+                'total_weeks_planned': len(df),
+                'weeks_completed': 0,
+                'completion_rate': 0,
+                'average_performance': 'N/A',
+                'total_volume': 0,
+                'max_weight_lifted': 0,
+                'progression_rate': 0
+            }
+        
+        stats = {
+            'total_weeks_planned': len(df),
+            'weeks_completed': len(actual_data),
+            'completion_rate': len(actual_data) / len(df) * 100,
+            'average_performance': actual_data['performance_status'].mode().iloc[0] if not actual_data.empty else 'N/A',
+            'total_volume': actual_data['actual_volume'].sum(),
+            'max_weight_lifted': actual_data['actual_weight'].max(),
+            'progression_rate': (actual_data['actual_weight'].iloc[-1] - actual_data['actual_weight'].iloc[0]) / len(actual_data) if len(actual_data) > 1 else 0
+        }
+        
+        return stats
+    
+    def close(self):
+        """Close database connection"""
+        self.conn.close()
+
+
+# Example usage and demonstration
+def main():
+    """Demonstration of the Strength Progression Tracker"""
+    
+    # Initialize tracker
+    tracker = StrengthProgressionTracker("strength_tracker.db")
+    
+    print("🏋️ Strength Progression Tracker Initialized")
+    print("=" * 50)
+    
+    # Example: Close Grip Bench Press progression
+    exercise = "Close Grip Bench Press"
+    current_max = 60  # kg
+    goal_weight = 80  # kg
+    num_weeks = 10
+    
+    print(f"\n📊 Generating progression plan for {exercise}")
+    print(f"   Current Max: {current_max} kg")
+    print(f"   Goal: {goal_weight} kg")
+    print(f"   Duration: {num_weeks} weeks")
+    print("-" * 50)
+    
+    # Generate progression plan
+    plan_df = tracker.generate_progression_plan(
+        exercise_name=exercise,
+        current_max=current_max,
+        goal_weight=goal_weight,
+        num_weeks=num_weeks,
+        category="barbell",
+        starting_percentage=0.85
+    )
+    
+    # Display plan
+    print("\n📅 Weekly Progression Plan:")
+    for _, row in plan_df.iterrows():
+        deload_text = " (DELOAD)" if row['is_deload'] else ""
+        print(f"   Week {row['week_number']:2d}: {row['planned_weight']:.1f} kg - "
+              f"{row['sets']}×{row['reps_min']}-{row['reps_max']} reps{deload_text}")
+    
+    # Save plan to database
+    plan_ids = tracker.save_progression_plan(plan_df)
+    print(f"\n✅ Plan saved to database ({len(plan_ids)} weeks)")
+    
+    # Simulate logging some workouts
+    print("\n📝 Logging sample workout data...")
+    
+    # Week 1: Normal performance
+    status1 = tracker.log_workout(
+        exercise_name=exercise,
+        week_number=1,
+        actual_weight=51.0,  # Slightly above planned
+        actual_sets=3,
+        actual_reps=5,
+        notes="Felt good, solid form"
+    )
+    print(f"   Week 1: {status1}")
+    
+    # Week 2: Easy performance
+    status2 = tracker.log_workout(
+        exercise_name=exercise,
+        week_number=2,
+        actual_weight=55.0,  # Well above planned
+        actual_sets=3,
+        actual_reps=7,
+        notes="Stronger than expected!"
+    )
+    print(f"   Week 2: {status2}")
+    
+    # Week 3: Normal performance
+    status3 = tracker.log_workout(
+        exercise_name=exercise,
+        week_number=3,
+        actual_weight=57.5,
+        actual_sets=3,
+        actual_reps=5,
+        notes="Getting challenging"
+    )
+    print(f"   Week 3: {status3}")
+    
+    # Get summary statistics
+    stats = tracker.get_summary_statistics(exercise)
+    print("\n📈 Summary Statistics:")
+    print(f"   Weeks Completed: {stats['weeks_completed']}/{stats['total_weeks_planned']}")
+    print(f"   Completion Rate: {stats['completion_rate']:.1f}%")
+    print(f"   Average Performance: {stats['average_performance']}")
+    print(f"   Total Volume: {stats['total_volume']:.0f} kg")
+    print(f"   Max Weight Lifted: {stats['max_weight_lifted']:.1f} kg")
+    print(f"   Progression Rate: {stats['progression_rate']:.2f} kg/week")
+    
+    # Create visualization
+    print("\n🎨 Generating interactive visualization...")
+    fig = tracker.create_progression_visualization(exercise)
+    
+    if fig:
+        # Save visualization
+        fig.write_html("strength_progression.html")
+        print("   ✅ Visualization saved as 'strength_progression.html'")
+        
+        # Optionally show in browser
+        # fig.show()
+    
+    # Additional example: Dumbbell exercise
+    print("\n" + "=" * 50)
+    print("📊 Adding Dumbbell Exercise Example")
+    
+    db_exercise = "Dumbbell Shoulder Press"
+    plan_df2 = tracker.generate_progression_plan(
+        exercise_name=db_exercise,
+        current_max=20,  # kg per hand
+        goal_weight=30,  # kg per hand
+        num_weeks=8,
+        category="dumbbell",
+        starting_percentage=0.80
+    )
+    
+    tracker.save_progression_plan(plan_df2)
+    print(f"✅ {db_exercise} plan created and saved")
+    
+    # Close connection
+    tracker.close()
+    print("\n✅ Database connection closed")
+    print("🏁 Demo completed successfully!")
+
+
