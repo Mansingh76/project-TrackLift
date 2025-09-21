@@ -1,0 +1,74 @@
+# Strength Progression Tracker - Database Schema
+
+## Entity Relationship Diagram
+
+```
+┌─────────────────────────┐
+│      exercises          │
+├─────────────────────────┤
+│ PK: exercise_id (INT)   │
+│ exercise_name (TEXT)    │
+│ category (TEXT)         │
+│ increment_kg (REAL)     │
+│ created_at (TIMESTAMP)  │
+└─────────────────────────┘
+           │
+           │ 1
+           │
+           │ *
+┌─────────────────────────┐         ┌─────────────────────────┐
+│   progression_plans     │         │      user_logs          │
+├─────────────────────────┤         ├─────────────────────────┤
+│ PK: plan_id (INT)       │         │ PK: log_id (INT)        │
+│ FK: exercise_id (INT)   │         │ FK: exercise_id (INT)   │
+│ week_number (INT)       │         │ FK: plan_id (INT)       │
+│ planned_weight (REAL)   │         │ week_number (INT)       │
+│ sets (INT)              │         │ actual_weight (REAL)    │
+│ reps_min (INT)          │         │ actual_sets (INT)       │
+│ reps_max (INT)          │         │ actual_reps (INT)       │
+│ is_deload (BOOLEAN)     │         │ performance_status (TEXT)│
+│ created_at (TIMESTAMP)  │         │ notes (TEXT)            │
+└─────────────────────────┘         │ logged_at (TIMESTAMP)   │
+           │                         └─────────────────────────┘
+           │ 1                                    │
+           │                                      │ *
+           └──────────────────────────────────────┘
+
+```
+
+## Table Descriptions
+
+### 1. **exercises**
+- `exercise_id`: Primary key, auto-increment
+- `exercise_name`: Name of the exercise (e.g., "Close Grip Bench Press")
+- `category`: Type of exercise ("barbell", "dumbbell", "isolation")
+- `increment_kg`: Weekly weight increment based on category
+- `created_at`: Timestamp of when exercise was added
+
+### 2. **progression_plans**
+- `plan_id`: Primary key, auto-increment
+- `exercise_id`: Foreign key to exercises table
+- `week_number`: Week number in the progression (1, 2, 3...)
+- `planned_weight`: Target weight for that week
+- `sets`: Number of sets planned
+- `reps_min`: Minimum reps target
+- `reps_max`: Maximum reps target
+- `is_deload`: Boolean flag for deload weeks
+- `created_at`: Timestamp of plan creation
+
+### 3. **user_logs**
+- `log_id`: Primary key, auto-increment
+- `exercise_id`: Foreign key to exercises table
+- `plan_id`: Foreign key to progression_plans table (nullable for unplanned workouts)
+- `week_number`: Week number of the actual workout
+- `actual_weight`: Weight actually lifted
+- `actual_sets`: Sets actually completed
+- `actual_reps`: Average reps per set
+- `performance_status`: Calculated status ("Easy", "Normal", "Fail")
+- `notes`: Optional user notes
+- `logged_at`: Timestamp of when the workout was logged
+
+## Relationships
+- **exercises → progression_plans**: One-to-Many (one exercise can have multiple week plans)
+- **exercises → user_logs**: One-to-Many (one exercise can have multiple log entries)
+- **progression_plans → user_logs**: One-to-Many (one plan entry can have multiple logs if user repeats weeks)
